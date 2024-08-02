@@ -1,0 +1,162 @@
+import requests as rq
+from requests import Request, Session
+from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
+import json
+import pandas as pd
+import numpy as np
+import warnings
+import time
+start_time = time.time()
+import concurrent.futures
+import pandas as pd
+from functools import partial
+from functools import lru_cache
+
+# Global cache to store exchange tickers
+exchange_cache = {}
+CACHE_EXPIRY = 300  # Cache expiry time in seconds
+
+use_demo = {
+           "accept": "application/json",
+           "x-cg-demo-api-key" : "CG-dJDfFLuRKkCrDpBavDmDuBc3"
+}
+
+api_key = use_demo["x-cg-demo-api-key"]
+
+
+
+def get_response(endpoint, headers, params, URL):
+    url = "".join((URL, endpoint))
+    response = rq.get(url, headers = headers, params = params)
+    if response.status_code == 200:
+        data = response.json()
+        return data
+    else:
+        print(f"Failed to fetch data, check status code {response.status_code}")
+
+exchange_params = {
+            "per_page": 250,
+            "page": 1
+}
+
+PUB_URL = "https://api.coingecko.com/api/v3/"
+exchange_list_response = get_response("/exchanges", use_demo, exchange_params, PUB_URL)
+df_ex = pd.DataFrame(exchange_list_response)
+
+@lru_cache(maxsize=128)
+def get_exchange_tickers(id, api_key):
+    current_time = time.time()
+    if id in exchange_cache and current_time - exchange_cache[id]['timestamp'] < CACHE_EXPIRY:
+        return exchange_cache[id]['tickers']
+    
+    headers = {
+        "accept": "application/json",
+        "x-cg-demo-api-key": api_key
+    }
+    
+    exchange_ticker_response = get_response(f"/exchanges/{id}/tickers", headers, {}, PUB_URL)
+    tickers = {(ticker["base"], ticker["target"]): ticker for ticker in exchange_ticker_response["tickers"]}
+    exchange_cache[id] = {'tickers': tickers, 'timestamp': current_time}
+    return tickers
+
+def get_trade_exchange(id, base_curr, target_curr, api_key):
+    tickers = get_exchange_tickers(id, api_key)
+    found_match = tickers.get((base_curr, target_curr), "")
+    if found_match == "":
+        warnings.warn(f"No data found for {base_curr}-{target_curr} pair in {id}")
+    return found_match
+
+
+
+def fetch_price(id, base_curr, target_curr, alternative_target_curr, api_key):
+    try:
+        price = get_trade_exchange(id, base_curr, target_curr, api_key)['last']
+        return id, base_curr + target_curr, price
+    except:
+        try:
+            price = get_trade_exchange(id, base_curr, alternative_target_curr, api_key)['last']
+            return id, base_curr + alternative_target_curr, price
+        except:
+            return None
+
+def process_coin(coin, prices_dict):
+    filtered_prices = prices_dict.get(coin, {})
+    if not filtered_prices:
+        return None
+    
+    min_value = min(filtered_prices.values())
+    max_value = max(filtered_prices.values())
+    ex_with_min_price = min(filtered_prices, key=filtered_prices.get)
+    ex_with_max_price = max(filtered_prices, key=filtered_prices.get)
+    percentage_diff = (max_value - min_value) / min_value * 100
+    return coin, (ex_with_min_price, ex_with_max_price, percentage_diff)
+
+# Your existing setup
+exchanges = df_ex[:20]['id']
+index_to_drop = exchanges[exchanges == 'binance_us'].index
+# indices_to_drop = exchanges[exchanges.isin(['binance_us', 'bigone'])].index
+
+# Drop the index
+exchanges = exchanges.drop(index_to_drop).reset_index(drop=True)
+
+def cmc(starting_rank, number_of_tokens):
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+    parameters = {
+       'start':'1',
+       'limit': str(number_of_tokens),
+       'convert':'USD'
+    }
+    headers = {
+       'Accepts': 'application/json',
+       'X-CMC_PRO_API_KEY': 'f16256e3-8fed-4aa5-8695-e7061d0d2f09',
+    }
+    session = Session()
+    session.headers.update(headers)
+    
+    try:
+      response = session.get(url, params=parameters)
+      data = json.loads(response.text)
+      print(data)
+    except (ConnectionError, Timeout, TooManyRedirects) as e:
+      print(e)
+    
+    # exclude stablecoins
+    cmc_coin_list = []
+    for coin in data['data']:
+        if starting_rank <= coin['cmc_rank'] < number_of_tokens and 'stablecoin' not in coin['tags']:
+            cmc_coin_list.append(coin['symbol'])
+    return cmc_coin_list
+coin_list = cmc(0, 250)
+
+target_curr = 'USDT'
+alternative_target_curr = 'USD'
+
+
+# Fetch prices concurrently
+prices = {}
+fetch_func = partial(fetch_price, target_curr=target_curr, alternative_target_curr=alternative_target_curr, api_key=api_key)
+with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+    futures = [executor.submit(fetch_func, id, coin) for id in exchanges for coin in coin_list]
+    for future in concurrent.futures.as_completed(futures):
+        result = future.result()
+        if result:
+            id, pair, price = result
+            if pair[-4:] == 'USDT':
+                coin = pair[:-4]
+            else:
+                coin = pair[:-3]
+            if coin not in prices:
+                prices[coin] = {}
+            prices[coin][id] = price
+
+# Process differences
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    diffs = dict(filter(None, executor.map(partial(process_coin, prices_dict=prices), coin_list)))
+
+# Sort the results
+sorted_data = dict(sorted(diffs.items(), key=lambda item: item[1][2]))
+print(sorted_data)
+
+end_time = time.time()
+execution_time = end_time - start_time
+print(f"Execution time: {execution_time} seconds")
