@@ -1,0 +1,191 @@
+import ccxt
+from requests import Request, Session
+from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from bs4 import BeautifulSoup
+
+def cmc(starting_rank, number_of_tokens):
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+    parameters = {
+       'start':'1',
+       'limit': str(number_of_tokens),
+       'convert':'USD'
+    }
+    headers = {
+       'Accepts': 'application/json',
+       'X-CMC_PRO_API_KEY': 'f16256e3-8fed-4aa5-8695-e7061d0d2f09',
+    }
+    session = Session()
+    session.headers.update(headers)
+    
+    try:
+      response = session.get(url, params=parameters)
+      data = json.loads(response.text)
+      print(data)
+    except (ConnectionError, Timeout, TooManyRedirects) as e:
+      print(e)
+    
+    # exclude stablecoins
+    cmc_coin_list = []
+    for coin in data['data']:
+        if starting_rank <= coin['cmc_rank'] < number_of_tokens and 'stablecoin' not in coin['tags']:
+            cmc_coin_list.append(coin['symbol'])
+    return cmc_coin_list
+coins = cmc(0, 250)
+
+def fetch_withdrawal_fees(exchange, coin_symbol):
+    url = f'https://withdrawalfees.com/exchanges/{exchange}'
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        table = soup.find('table')
+        
+        if not table:
+            raise ValueError("Table not found on the page")
+        
+        for row in table.find_all('tr'):
+            columns = row.find_all('td')
+            if len(columns) > 1:
+                symbol_div = columns[0].find('div', class_='symbol')
+                if symbol_div and symbol_div.text.strip() == coin_symbol:
+                    withdrawal_fee_div = columns[1].find('div', class_='fee')
+                    if withdrawal_fee_div:
+                        withdrawal_fee = withdrawal_fee_div.text.strip()
+                        try:
+                            return float(withdrawal_fee.split()[0])
+                        except ValueError:
+                            return withdrawal_fee  # Return as string if not a number
+        
+        print(f"{coin_symbol} not found on {exchange} at withdrawalfees.com.")
+        return None
+    except requests.RequestException as e:
+        print(f"Error fetching data: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None
+
+def withdrawal_fees_data(exchange, coins):
+    coin_withdrawal_fees = {}
+    for coin in coins:
+        coin_withdrawal_fees[coin] = fetch_withdrawal_fees(exchange, coin)
+    return coin_withdrawal_fees
+
+def fetch_order_book(exchange, symbol):
+    try:
+        return exchange.fetch_order_book(symbol)
+    except ccxt.NetworkError as e:
+        print(f"Network error fetching order book for {exchange.id} {symbol}: {str(e)}")
+    except ccxt.ExchangeError as e:
+        print(f"Exchange error fetching order book for {exchange.id} {symbol}: {str(e)}")
+    except Exception as e:
+        print(f"Unexpected error fetching order book for {exchange.id} {symbol}: {str(e)}")
+    return None
+
+def fetch_all_order_books(exchanges, symbols):
+    order_books = {symbol: {} for symbol in symbols}
+    with ThreadPoolExecutor(max_workers=len(exchanges) * len(symbols)) as executor:
+        future_to_order_book = {
+            executor.submit(fetch_order_book, exchange, symbol): (exchange.id, symbol)
+            for exchange in exchanges.values()
+            for symbol in symbols
+        }
+        for future in as_completed(future_to_order_book):
+            exchange_id, symbol = future_to_order_book[future]
+            order_book = future.result()
+            if order_book:
+                order_books[symbol][exchange_id] = order_book
+    return order_books
+
+# THE SOLUTION BELOW IS NOT CORRECT. WHEN WITHDRAWAL FEE IS NOT AVAIALBLE, IT SHOULD NOT BE 0.
+# IT'S JUST FOR TESTING. IN THE FUTURE FIND A PROPER SOLUTION
+def calculate_profit_with_fees(buy_exchange, sell_exchange, buy_price, sell_price, amount, withdrawal_fees, symbol):
+    coins_bought = amount / buy_price
+    withdrawal_fee = withdrawal_fees.get(buy_exchange, {}).get(symbol.split('/')[0], 0)
+    
+    # Handle the case where withdrawal_fee might be None
+    if withdrawal_fee is None:
+        print(f"Warning: Withdrawal fee for {symbol.split('/')[0]} on {buy_exchange} is None. Assuming 0.")
+        withdrawal_fee = 0
+    
+    coins_after_withdrawal = coins_bought - withdrawal_fee
+    sale_amount = coins_after_withdrawal * sell_price
+    profit = sale_amount - amount
+    profit_percentage = (profit / amount) * 100
+    return profit, profit_percentage
+
+def find_arbitrage_opportunities(all_order_books, initial_capital, withdrawal_fees, min_profit_percentage):
+    opportunities = []
+    for symbol, order_books in all_order_books.items():
+        exchange_names = list(order_books.keys())
+        for i in range(len(exchange_names)):
+            for j in range(i + 1, len(exchange_names)):
+                buy_exchange = exchange_names[i]
+                sell_exchange = exchange_names[j]
+                
+                if not order_books[buy_exchange]['asks'] or not order_books[sell_exchange]['bids']:
+                    continue
+
+                buy_price = order_books[buy_exchange]['asks'][0][0]
+                sell_price = order_books[sell_exchange]['bids'][0][0]
+                
+                profit, profit_percentage = calculate_profit_with_fees(
+                    buy_exchange, sell_exchange, buy_price, sell_price, 
+                    initial_capital, withdrawal_fees, symbol
+                )
+                
+                if profit_percentage > min_profit_percentage:
+                    opportunities.append({
+                        'symbol': symbol,
+                        'buy_exchange': buy_exchange,
+                        'sell_exchange': sell_exchange,
+                        'buy_price': buy_price,
+                        'sell_price': sell_price,
+                        'profit': profit,
+                        'profit_percentage': profit_percentage
+                    })
+    
+    return opportunities
+
+def main():
+    exchanges = {
+        'binance': ccxt.binance(),
+        'huobi': ccxt.huobi(),
+        'kucoin': ccxt.kucoin(),
+        # 'gateio': ccxt.gateio(),
+        # 'crypto-com: ccxt.cryptocom()
+    }
+    
+    symbols = [f"{coin}/USDT" for coin in coins]
+    initial_capital = 5000  # $5000 initial capital
+    min_profit_percentage = 0.1  # 0.1% minimum profit
+    
+    # Fetch withdrawal fees for each exchange
+    withdrawal_fees = {
+        exchange: withdrawal_fees_data(exchange, coins)
+        for exchange in exchanges.keys()
+    }
+    
+    while True:
+        all_order_books = fetch_all_order_books(exchanges, symbols)
+        opportunities = find_arbitrage_opportunities(all_order_books, initial_capital, withdrawal_fees, min_profit_percentage)
+        
+        if opportunities:
+            print("Arbitrage opportunities found:")
+            for opportunity in opportunities:
+                print(f"Symbol: {opportunity['symbol']}")
+                print(f"Buy from {opportunity['buy_exchange']} at {opportunity['buy_price']}")
+                print(f"Sell on {opportunity['sell_exchange']} at {opportunity['sell_price']}")
+                print(f"Potential profit: ${opportunity['profit']:.2f} ({opportunity['profit_percentage']:.2f}%)")
+                print("---")
+        else:
+            print("No profitable arbitrage opportunities found.")
+        
+        time.sleep(10)  # Wait for 10 seconds before checking again
+
+if __name__ == "__main__":
+    main()
